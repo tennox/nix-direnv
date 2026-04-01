@@ -254,6 +254,17 @@ nix_direnv_manual_reload() {
   _nix_direnv_manual_reload=1
 }
 
+# When enabled, nix builds run in the background instead of blocking the shell.
+# If a stale cache exists, it is loaded immediately while rebuilding.
+# If no cache exists (first time), the prompt returns instantly with no env
+# and the env loads automatically once the build finishes.
+# The build signals completion by touching .envrc, causing direnv to reload.
+# Exports DIRENV_BG_PID so the shell hook can show build status.
+: "${_nix_direnv_background_reload:=${NIX_DIRENV_BACKGROUND_RELOAD:-0}}"
+nix_direnv_background_reload() {
+  _nix_direnv_background_reload=1
+}
+
 : "${_nix_direnv_allow_fallback:=1}"
 nix_direnv_disallow_fallback() {
   _nix_direnv_info "Fallback disallowed"
@@ -266,6 +277,129 @@ _nix_direnv_warn_manual_reload() {
   else
     _nix_direnv_warning 'cache does not exist. use "nix-direnv-reload" to create it'
   fi
+}
+
+_nix_direnv_is_bg_running() {
+  local pidfile=$1
+  if [[ -e $pidfile ]]; then
+    local old_pid
+    old_pid=$(<"$pidfile")
+    if kill -0 "$old_pid" 2>/dev/null; then
+      return 0
+    fi
+    rm -f "$pidfile"
+  fi
+  return 1
+}
+
+_nix_direnv_start_bg_flake() {
+  local layout_dir=$1 profile=$2 profile_rc=$3 flake_inputs=$4 flake_uri=$5
+  shift 5
+  local srcdir=$PWD
+  local nix_bin=$_nix_direnv_nix
+  local pidfile="${layout_dir}/bg-rebuild.pid"
+
+  # Don't start a second build
+  if _nix_direnv_is_bg_running "$pidfile"; then
+    local bg_pid
+    bg_pid=$(<"$pidfile")
+    _nix_direnv_info "Background rebuild already running (pid $bg_pid)"
+    export DIRENV_BG_PID=$bg_pid
+    return 0
+  fi
+
+  (
+    # Detach from direnv's capture pipe and silence output
+    exec 3>&- 2>/dev/null
+    exec >/dev/null 2>/dev/null
+
+    echo $BASHPID >"$pidfile"
+
+    local tmp_profile="${layout_dir}/flake-tmp-profile.$BASHPID"
+    local tmp_profile_rc
+    if tmp_profile_rc=$($nix_bin --no-warn-dirty \
+      --extra-experimental-features "nix-command flakes" \
+      print-dev-env --profile "$tmp_profile" "$@"); then
+
+      # Clean old gcroots and update cache
+      rm -rf "$layout_dir/flake-inputs/"
+      rm -f "$layout_dir"/{nix,flake}-profile*
+
+      echo "$tmp_profile_rc" >"$profile_rc"
+      $nix_bin --no-warn-dirty \
+        --extra-experimental-features "nix-command flakes" \
+        build --out-link "$profile" "$tmp_profile"
+      rm -f "$tmp_profile" "$tmp_profile"*
+
+      # GC roots for flake inputs
+      mkdir -p "$flake_inputs"
+      local flake_input_paths
+      flake_input_paths=$($nix_bin --no-warn-dirty \
+        --extra-experimental-features "nix-command flakes" \
+        flake archive --json --no-write-lock-file -- "$flake_uri")
+      while [[ $flake_input_paths =~ /nix/store/[^\"]+ ]]; do
+        local store_path="${BASH_REMATCH[0]}"
+        $nix_bin --no-warn-dirty \
+          --extra-experimental-features "nix-command flakes" \
+          build --out-link "${flake_inputs}/${store_path##*/}" "${store_path}"
+        flake_input_paths="${flake_input_paths/${store_path}/}"
+      done
+    fi
+
+    rm -f "$pidfile"
+    # Signal direnv to reload on next prompt
+    touch "${srcdir}/.envrc"
+  ) &
+  disown
+
+  export DIRENV_BG_PID=$!
+}
+
+_nix_direnv_start_bg_nix() {
+  local layout_dir=$1 profile=$2 profile_rc=$3
+  shift 3
+  local srcdir=$PWD
+  local nix_bin=$_nix_direnv_nix
+  local pidfile="${layout_dir}/bg-rebuild.pid"
+
+  if _nix_direnv_is_bg_running "$pidfile"; then
+    local bg_pid
+    bg_pid=$(<"$pidfile")
+    _nix_direnv_info "Background rebuild already running (pid $bg_pid)"
+    export DIRENV_BG_PID=$bg_pid
+    return 0
+  fi
+
+  (
+    exec 3>&- 2>/dev/null
+    exec >/dev/null 2>/dev/null
+
+    echo $BASHPID >"$pidfile"
+
+    export IN_NIX_SHELL="impure"
+
+    local tmp_profile="${layout_dir}/nix-tmp-profile.$BASHPID"
+    local tmp_profile_rc
+    if tmp_profile_rc=$($nix_bin --no-warn-dirty \
+      --extra-experimental-features "nix-command flakes" \
+      print-dev-env --profile "$tmp_profile" --impure "$@"); then
+
+      rm -rf "$layout_dir/flake-inputs/"
+      rm -f "$layout_dir"/{nix,flake}-profile*
+
+      echo "$tmp_profile_rc" >"$profile_rc"
+      $nix_bin --no-warn-dirty \
+        --extra-experimental-features "nix-command flakes" \
+        build --out-link "$profile" "$tmp_profile"
+      rm -f "$tmp_profile" "$tmp_profile"*
+    fi
+
+    rm -f "$pidfile"
+    touch "${srcdir}/.envrc"
+  ) &
+  disown
+
+  export DIRENV_BG_PID=$!
 }
 
 use_flake() {
@@ -337,6 +471,15 @@ use_flake() {
   if [[ $profile_missing -eq 1 || $profile_rc_missing -eq 1 || $file_nt_profilerc -eq 1 ]]; then
     if [[ $_nix_direnv_manual_reload -eq 1 && -z ${_nix_direnv_force_reload-} ]]; then
       _nix_direnv_warn_manual_reload "$profile_rc"
+
+    elif [[ $_nix_direnv_background_reload -eq 1 && -z ${_nix_direnv_force_reload-} ]]; then
+      # Background rebuild: load stale cache if available, build in background
+      if [[ -e $profile_rc ]]; then
+        _nix_direnv_info "Using cached dev shell (updating in background)"
+      else
+        _nix_direnv_info "No cache yet, building devshell in background"
+      fi
+      _nix_direnv_start_bg_flake "$layout_dir" "$profile" "$profile_rc" "$flake_inputs" "$flake_uri" "$@"
 
     else
       local tmp_profile_rc
@@ -519,6 +662,26 @@ use_nix() {
   if [[ $profile_missing -eq 1 || $profile_rc_missing -eq 1 || $file_nt_profilerc -eq 1 ]]; then
     if [[ $_nix_direnv_manual_reload -eq 1 && -z ${_nix_direnv_force_reload-} ]]; then
       _nix_direnv_warn_manual_reload "$profile_rc"
+
+    elif [[ $_nix_direnv_background_reload -eq 1 && -z ${_nix_direnv_force_reload-} ]]; then
+      if [[ -e $profile_rc ]]; then
+        _nix_direnv_info "Using cached dev shell (updating in background)"
+      else
+        _nix_direnv_info "No cache yet, building devshell in background"
+      fi
+
+      # Prepare extra_args before passing to background
+      if [[ -n $packages ]]; then
+        extra_args+=("--expr" "with import <nixpkgs> {}; mkShell { buildInputs = [ $packages ]; }")
+      else
+        extra_args+=("--file" "$nixfile")
+        if [[ -n $attribute ]]; then
+          extra_args+=("$attribute")
+        fi
+      fi
+
+      _nix_direnv_start_bg_nix "$layout_dir" "$profile" "$profile_rc" "${extra_args[@]}"
+
     else
       local tmp_profile="${layout_dir}/nix-tmp-profile.$$"
       local tmp_profile_rc
