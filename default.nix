@@ -52,6 +52,7 @@ resholve.mkDerivation rec {
 
         # Nix fallback implementation
         "$_nix_direnv_nix" = true;
+        "$nix_bin" = true;
         "$ambient_nix" = true;
         "$NIX_DIRENV_FALLBACK_NIX" = true;
       };
